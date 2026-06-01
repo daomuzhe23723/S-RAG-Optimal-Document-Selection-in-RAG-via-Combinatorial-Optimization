@@ -2,35 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 S-RAG: Optimal Document Selection in RAG via Combinatorial Optimization
-Core implementation of the submodular document selection algorithm.
-
-Reference:
-    Anonymous et al. (2026). "Optimal Document Selection in RAG via 
-    Combinatorial Optimization: A Theoretical Framework." 
-    (ACL submission).
-
-Problem Formulation:
-    - Input:  query q, candidate documents D = {d_1,...,d_n}, token costs c_i,
-              strict token budget B, retriever scores rel(d_i, q).
-    - Output: subset S ⊆ D such that Σ_{i∈S} c_i ≤ B.
-    - Objective: maximize weighted coverage function 
-                f(S) = Σ_{u∈U} w(u)·1[u ∈ ∪_{d∈S} U(d)]
-                which is provably monotone and submodular (Lemma 1).
-
-Algorithm (Algorithm 1 from paper):
-    Partial Enumeration + Density-Greedy Completion.
-    1. Initialize S_best with the best feasible solution of size ≤ 2.
-    2. Enumerate all feasible seeds U ⊆ D with |U| = 3 and c(U) ≤ B.
-    3. For each seed, greedily complete by maximizing marginal-gain density:
-       d* = argmax_{d feasible} Δ_f(d|S) / c(d).
-    4. Return the best S across all seeds and the size-≤2 solution.
-    Approximation guarantee: (1 - 1/e) for the surrogate objective (Theorem 1).
-
-Changes from original code:
-    - Objective changed from probabilistic soft-coverage to hard set-coverage (Eq. 4).
-    - Algorithm changed from simple greedy to partial-enumeration + density greedy.
-    - Concept universe U now built from top-L candidate documents (not from query).
-    - Concept weights w(u) now use max retriever score (not query tf).
+修复版本：
+  1. 默认使用 nltk 名词/动词 lemma 提取（与论文 Appendix B.2 一致）
+  2. 密度贪心中使用增量 covered 集合（避免每次从头重算，提升速度）
+  3. select() 返回 (indices, truncated_docs, costs) 供 generate.py 截断使用
 """
 
 import itertools
@@ -39,20 +14,35 @@ from collections import Counter
 from typing import Dict, List, Optional, Set, Tuple
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ConceptExtractor
+# ─────────────────────────────────────────────────────────────────────────────
 class ConceptExtractor:
     """
-    Extracts query-relevant concepts from text.
-    Paper uses: lowercase, tokenize, lemmatize, remove stopwords,
-    then extract noun/verb lemmas (Appendix B.2).
+    从文本中提取概念。
+    论文 Appendix B.2：lowercase → tokenize → lemmatize → 去停用词 → 取名词/动词 lemma。
+    
+    method 优先级：nltk > noun_chunks(spaCy) > simple(正则回退)
     """
 
-    def __init__(self, method: str = "simple"):
-        """
-        Args:
-            method: "nltk" (POS-aware lemmatization, requires nltk),
-                    "noun_chunks" (requires spaCy),
-                    or "simple" (regex-based, no deps).
-        """
+    STOPWORDS: Set[str] = {
+        "a", "an", "the", "and", "or", "but", "if", "in", "on", "at", "to",
+        "for", "of", "with", "by", "from", "is", "was", "are", "were", "be",
+        "been", "being", "have", "has", "had", "do", "does", "did", "will",
+        "would", "could", "should", "may", "might", "shall", "can", "need",
+        "that", "this", "these", "those", "it", "its", "they", "them", "their",
+        "we", "us", "our", "you", "your", "he", "she", "his", "her", "i", "my",
+        "me", "what", "which", "who", "whom", "whose", "when", "where", "why",
+        "how", "not", "no", "nor", "so", "yet", "both", "either", "neither",
+        "each", "every", "all", "any", "few", "more", "most", "other", "some",
+        "such", "than", "then", "just", "over", "also", "only", "very", "too",
+        "into", "about", "after", "before", "between", "through", "during",
+        "while", "although", "because", "since", "until", "unless", "whether",
+        "as", "up", "out", "there", "here", "now", "one", "two", "first",
+        "new", "old", "many", "much", "same", "even", "back", "still",
+    }
+
+    def __init__(self, method: str = "nltk"):
         self.method = method
         self.lemmatizer = None
         self.nlp = None
@@ -61,54 +51,60 @@ class ConceptExtractor:
             try:
                 import nltk
                 from nltk.stem import WordNetLemmatizer
-                # Download required NLTK data quietly if missing
-                for pkg in ('punkt', 'averaged_perceptron_tagger', 'wordnet'):
+                for pkg, path in [
+                    ('punkt_tab',        'tokenizers/punkt_tab'),
+                    ('averaged_perceptron_tagger_eng', 'taggers/averaged_perceptron_tagger_eng'),
+                    ('wordnet',          'corpora/wordnet'),
+                    ('stopwords',        'corpora/stopwords'),
+                ]:
                     try:
-                        nltk.data.find(f'tokenizers/{pkg}' if pkg == 'punkt' else f'taggers/{pkg}' if pkg == 'averaged_perceptron_tagger' else f'corpora/{pkg}')
+                        nltk.data.find(path)
                     except LookupError:
                         nltk.download(pkg, quiet=True)
                 self.lemmatizer = WordNetLemmatizer()
-            except Exception:
-                print("[Warning] NLTK not available. Falling back to simple extraction.")
+            except Exception as e:
+                print(f"[Warning] NLTK 不可用（{e}），退回 simple 模式。")
                 self.method = "simple"
 
         elif method == "noun_chunks":
             try:
                 import spacy
-                self.nlp = spacy.load("en_core_web_sm", disable=["parser", "ner"])
-            except Exception:
-                print("[Warning] spaCy model not available. Falling back to simple extraction.")
+                self.nlp = spacy.load("en_core_web_sm",
+                                      disable=["parser", "ner"])
+            except Exception as e:
+                print(f"[Warning] spaCy 不可用（{e}），退回 simple 模式。")
                 self.method = "simple"
 
     def extract(self, text: str) -> Dict[str, float]:
-        """Extract concepts and return normalized within-doc frequencies."""
-        if self.method=="nltk" and self.lemmatizer is not None:
-            return self._extract_nltk(text)
-        elif self.method=="noun_chunks" and self.nlp is not None:
-            return self._extract_spacy(text)
+        if self.method == "nltk" and self.lemmatizer is not None:
+            result = self._extract_nltk(text)
+        elif self.method == "noun_chunks" and self.nlp is not None:
+            result = self._extract_spacy(text)
         else:
-            return self._extract_simple(text)
+            result = self._extract_simple(text)
+        return result if result else self._extract_simple(text)
 
     def _extract_nltk(self, text: str) -> Dict[str, float]:
         import nltk
         tokens = nltk.word_tokenize(text.lower())
         tagged = nltk.pos_tag(tokens)
-        stopwords = self._get_stopwords()
 
         concepts = []
         for word, tag in tagged:
-            word = re.sub(r"[^a-z0-9]", "", word)
-            if len(word) <= 2 or word.isnumeric() or word in stopwords:
+            word_clean = re.sub(r"[^a-z0-9]", "", word)
+            if len(word_clean) <= 2 or word_clean in self.STOPWORDS:
                 continue
-            # Keep nouns (NN*) and verbs (VB*) as per paper
-            if tag.startswith('NN') or tag.startswith('VB'):
-                pos = 'n' if tag.startswith('NN') else 'v'
-                lemma = self.lemmatizer.lemmatize(word, pos=pos)
+            if tag.startswith("NN"):
+                lemma = self.lemmatizer.lemmatize(word_clean, pos="n")
                 concepts.append(lemma)
+            elif tag.startswith("VB"):
+                lemma = self.lemmatizer.lemmatize(word_clean, pos="v")
+                if lemma not in {"be", "have", "do", "say", "get", "make",
+                                  "go", "know", "take", "see", "come", "use"}:
+                    concepts.append(lemma)
 
         if not concepts:
-            return self._extract_simple(text)
-
+            return {}
         counts = Counter(concepts)
         total = sum(counts.values())
         return {k: v / total for k, v in counts.items()}
@@ -117,350 +113,234 @@ class ConceptExtractor:
         doc = self.nlp(text)
         concepts = []
         for token in doc:
-            if token.pos_ in ('NOUN', 'VERB', 'PROPN') and not token.is_stop and len(token.lemma_) > 2:
+            if (token.pos_ in ("NOUN", "VERB", "PROPN")
+                    and not token.is_stop
+                    and len(token.lemma_) > 2
+                    and token.lemma_ not in self.STOPWORDS):
                 concepts.append(token.lemma_.lower())
         if not concepts:
-            return self._extract_simple(text)
+            return {}
         counts = Counter(concepts)
         total = sum(counts.values())
         return {k: v / total for k, v in counts.items()}
 
     def _extract_simple(self, text: str) -> Dict[str, float]:
-        """
-        Fallback regex-based extraction.
-        Lowercases, removes stopwords, keeps words >= 4 chars.
-        """
         words = re.findall(r"\b[a-z]{4,}\b", text.lower())
-        stopwords = self._get_stopwords()
-        words = [w for w in words if w not in stopwords]
+        words = [w for w in words if w not in self.STOPWORDS]
         if not words:
             return {}
         counts = Counter(words)
         total = sum(counts.values())
         return {k: v / total for k, v in counts.items()}
-        
-    @staticmethod
-    def _get_stopwords() -> Set[str]:
-        return {
-            "that", "with", "from", "they", "have", "this", "will", "your",
-            "what", "when", "where", "which", "their", "there", "about",
-            "could", "would", "should", "than", "then", "them", "been",
-            "being", "over", "also", "only", "some", "time", "very", "after",
-            "before", "just", "into", "such", "make", "made", "like", "other",
-            "more", "most", "many", "much", "how", "who", "whom", "whose",
-            "why", "shall", "may", "might", "must", "can", "does", "did",
-            "done", "doing", "has", "had", "having", "get", "gets", "got",
-            "gotten", "getting", "use", "used", "using", "say", "said", "says",
-            "going", "go", "went", "gone", "know", "knew", "known", "knows",
-            "think", "thought", "thinks", "see", "saw", "seen", "sees",
-            "come", "came", "comes", "coming", "want", "wanted", "wants",
-            "look", "looked", "looking", "looks", "way", "ways", "find",
-            "found", "finding", "finds", "give", "gave", "given", "gives",
-            "giving", "tell", "told", "telling", "tells", "work", "worked",
-            "working", "works", "call", "called", "calling", "calls", "try",
-            "tried", "tries", "trying", "need", "needed", "needing", "needs",
-            "feel", "felt", "feeling", "feels", "become", "became", "becomes",
-            "becoming", "leave", "left", "leaves", "leaving", "put", "puts",
-            "putting", "mean", "means", "meant", "meaning", "keep", "keeps",
-            "kept", "keeping", "let", "lets", "letting", "begin", "began",
-            "begun", "begins", "beginning", "seem", "seemed", "seeming",
-            "seems", "help", "helped", "helping", "helps", "show", "showed",
-            "shown", "shows", "showing", "hear", "heard", "hearing", "hears",
-            "play", "played", "playing", "plays", "run", "ran", "running",
-            "runs", "move", "moved", "moves", "moving", "live", "lived",
-            "lives", "living", "believe", "believed", "believes", "believing",
-            "bring", "brought", "bringing", "brings", "happen", "happened",
-            "happening", "happens", "stand", "stood", "standing", "stands",
-            "lose", "lost", "loses", "losing", "pay", "paid", "paying",
-            "pays", "meet", "met", "meeting", "meets", "include", "included",
-            "includes", "including", "continue", "continued", "continues",
-            "continuing", "set", "sets", "setting", "learn", "learned",
-            "learning", "learns", "change", "changed", "changes", "changing",
-            "lead", "led", "leading", "leads", "understand", "understood",
-            "understanding", "understands", "watch", "watched", "watches",
-            "watching", "follow", "followed", "following", "follows", "stop",
-            "stopped", "stopping", "stops", "create", "created", "creates",
-            "creating", "speak", "spoke", "spoken", "speaks", "speaking",
-            "read", "reads", "reading", "allow", "allowed", "allowing",
-            "allows", "add", "added", "adding", "adds", "spend", "spent",
-            "spending", "spends", "grow", "grew", "grown", "grows", "growing",
-            "open", "opened", "opening", "opens", "walk", "walked", "walking",
-            "walks", "win", "won", "winning", "wins", "offer", "offered",
-            "offering", "offers", "remember", "remembered", "remembering",
-            "remembers", "love", "loved", "loves", "loving", "consider",
-            "considered", "considering", "considers", "appear", "appeared",
-            "appearing", "appears", "buy", "bought", "buying", "buys", "wait",
-            "waited", "waiting", "waits", "serve", "served", "serves",
-            "serving", "die", "died", "dies", "dying", "send", "sent",
-            "sending", "sends", "expect", "expected", "expecting", "expects",
-            "build", "built", "building", "builds", "stay", "stayed", "staying",
-            "stays", "fall", "fell", "fallen", "falling", "falls", "cut", "cuts",
-            "cutting", "reach", "reached", "reaches", "reaching", "kill",
-            "killed", "killing", "kills", "remain", "remained", "remaining",
-            "remains", "suggest", "suggested", "suggesting", "suggests",
-            "raise", "raised", "raises", "raising", "pass", "passed", "passes",
-            "passing", "sell", "sold", "selling", "sells", "require", "required",
-            "requiring", "requires", "report", "reported", "reporting", "reports",
-            "decide", "decided", "decides", "deciding", "pull", "pulled",
-            "pulling", "pulls"
-        }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# WeightedCoverageFunction
+# ─────────────────────────────────────────────────────────────────────────────
 class WeightedCoverageFunction:
     """
-    Weighted coverage objective from S-RAG (Eq. 4 in paper).
-
-    f(S) = Σ_{u∈U} w(u) · 1[ u ∈ ∪_{d∈S} U(d) ]
-
-    Properties (per paper, Lemma 1):
-        - Monotone: adding a document never decreases coverage.
-        - Submodular: diminishing returns (marginal gain decreases as S grows).
+    论文公式 (4)：
+        f(S) = Σ_{u∈U} w(u) · 1[ u ∈ ∪_{d∈S} U(d) ]
     """
 
-    def __init__(self, concept_weights: Dict[str, float],
+    def __init__(self,
+                 concept_weights: Dict[str, float],
                  doc_concepts: List[Set[str]]):
-        """
-        Args:
-            concept_weights: Dict concept -> w_c.
-            doc_concepts: List of Sets, where doc_concepts[i] is the set of
-                          concepts covered by document i.
-        """
         self.concept_weights = concept_weights
         self.doc_concepts = doc_concepts
 
     def evaluate(self, S: Set[int]) -> float:
-        """Compute f(S) via union of covered concepts."""
         if not S:
             return 0.0
-        covered_concepts = set()
-        for i in S:
-            covered_concepts.update(self.doc_concepts[i])
-        return float(sum(self.concept_weights.get(u,0.0) for u in covered_concepts))
-
-    def marginal_gain(self, S: Set[int], i: int) -> float:
-        """
-        Δ_f(i|S) = f(S ∪ {i}) - f(S)
-                  = Σ_{u ∈ U(d_i) \ ∪_{j∈S} U(d_j)} w(u)
-        """
-        if i in S:
-            return 0.0
         covered = set()
-        for j in S:
-            covered.update(self.doc_concepts[j])
-        new_covered = self.doc_concepts[i]-covered    
-        return float(sum(self.concept_weights.get(u,0.0) for u in new_covered))
+        for i in S:
+            covered.update(self.doc_concepts[i])
+        return float(sum(self.concept_weights.get(u, 0.0) for u in covered))
 
+    def marginal_gain(self, covered: Set[str], i: int) -> float:
+        new = self.doc_concepts[i] - covered
+        return float(sum(self.concept_weights.get(u, 0.0) for u in new))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SRAGSelector
+# ─────────────────────────────────────────────────────────────────────────────
 class SRAGSelector:
     """
-    S-RAG Document Selector.
-
-    Implements Algorithm 1 from the paper:
-    Partial Enumeration + Density-Greedy Completion for knapsack-constrained
-    monotone submodular maximization with (1 - 1/e) approximation guarantee.
+    论文 Algorithm 1：Partial Enumeration + Density-Greedy Completion
+    近似比保证：(1 - 1/e) ≈ 0.632  (Theorem 1)
     """
 
-    def __init__(self, budget: int,
+    def __init__(self,
+                 budget: int,
                  concept_extractor: Optional[ConceptExtractor] = None,
                  concept_depth: int = 20,
                  fast_mode: bool = False):
-        """
-        Args:
-            budget: Strict token budget B (knapsack capacity).
-            concept_extractor: Concept extraction module.
-            concept_depth: L in paper; number of top-ranked docs used to
-                           construct the concept universe U (default 20).
-            fast_mode: If True, skip partial enumeration (seed size 3) and use
-                       pure density-greedy. This loses the formal (1-1/e)
-                       guarantee but is much faster for large n. The paper's
-                       production system uses this fast variant (Appendix A).
-        """
-        self.budget=budget
-        self.concept_extractor=concept_extractor or ConceptExtractor(method="simple")
-        self.concept_depth=concept_depth
-        self.fast_mode=fast_mode
-
+        self.budget = budget
+        self.concept_extractor = (concept_extractor
+                                  or ConceptExtractor(method="nltk"))
+        self.concept_depth = concept_depth
+        self.fast_mode = fast_mode
 
     def _build_concept_universe_and_weights(
         self,
         docs: List[str],
-        retriever_scores: Optional[List[float]] = None
+        retriever_scores: List[float],
     ) -> Tuple[Dict[str, float], List[Set[str]]]:
-        """
-        Build concept universe U and concept weights w(u).
-
-        Following paper Appendix B.2:
-        - U is constructed from the top-L retrieved passages.
-        - w(u) = max_{d∈D : u∈U(d)} rel(d,q).
-        """
-        n=len(docs)
-        if retriever_scores is None:
-            retriever_scores = [1.0 / (i + 1) for i in range(n)]
-        doc_concepts=[]
-        for doc in docs:
-            extracted = self.concept_extractor.extract(doc)
-            doc_concepts.append(set(extracted.keys()))
-        
-        L=min(n,self.concept_depth)
-        concept_universe = set()
+        n = len(docs)
+        doc_concepts: List[Set[str]] = [
+            set(self.concept_extractor.extract(doc).keys())
+            for doc in docs
+        ]
+        L = min(n, self.concept_depth)
+        concept_universe: Set[str] = set()
         for i in range(L):
             concept_universe.update(doc_concepts[i])
-        concept_weights = {}
+
+        concept_weights: Dict[str, float] = {}
         for c in concept_universe:
-            w=0.0
+            w = 0.0
             for i in range(n):
                 if c in doc_concepts[i]:
-                    w=max(w,retriever_scores[i])
+                    w = max(w, retriever_scores[i])
             concept_weights[c] = w
-        return concept_weights, doc_concepts
 
+        return concept_weights, doc_concepts
 
     def _best_small_solution(
         self,
         candidates: List[int],
         costs: List[int],
         objective: WeightedCoverageFunction,
-        max_size: int = 2
     ) -> Set[int]:
-        best_S = set()
-        best_val = objective.evaluate(best_S)
+        best_S: Set[int] = set()
+        best_val = 0.0
 
         for i in candidates:
-            if costs[i]<=self.budget:
-                val=objective.evaluate({i})
+            if costs[i] <= self.budget:
+                val = objective.evaluate({i})
                 if val > best_val:
-                    best_val = val
-                    best_S = {i}
+                    best_val, best_S = val, {i}
 
-        if max_size >= 2:
-            for i, j in itertools.combinations(candidates, 2):
-                if costs[i]+costs[j]<=self.budget:
-                    val = objective.evaluate({i, j})
-                    if val > best_val:
-                        best_val = val
-                        best_S = {i, j}
+        for i, j in itertools.combinations(candidates, 2):
+            if costs[i] + costs[j] <= self.budget:
+                val = objective.evaluate({i, j})
+                if val > best_val:
+                    best_val, best_S = val, {i, j}
+
         return best_S
-        
 
     def _density_greedy_completion(
         self,
         seed: Set[int],
         candidates: List[int],
         costs: List[int],
-        objective: WeightedCoverageFunction
+        objective: WeightedCoverageFunction,
     ) -> Set[int]:
-        """
-        Density-greedy completion (Algorithm 1 lines 8-12).
-        Repeatedly add the feasible document with highest marginal gain density.
-        """
         S = set(seed)
         remaining = self.budget - sum(costs[i] for i in S)
+
+        covered: Set[str] = set()
+        for i in S:
+            covered.update(objective.doc_concepts[i])
+
         pool = [i for i in candidates if i not in S]
+
         while True:
             best_idx = None
             best_ratio = -1.0
-            best_gain = 0.0
+
             for i in pool:
                 if costs[i] > remaining:
                     continue
-                gain=objective.marginal_gain(S,i)
+                gain = objective.marginal_gain(covered, i)
                 if gain <= 1e-12:
                     continue
                 ratio = gain / costs[i]
-                if ratio>best_ratio:
-                    best_ratio=ratio
-                    best_idx=i
-                    best_gain = gain
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_idx = i
+
             if best_idx is None:
                 break
+
             S.add(best_idx)
+            covered.update(objective.doc_concepts[best_idx])
             pool.remove(best_idx)
             remaining -= costs[best_idx]
-        return S
 
+        return S
 
     def select(
         self,
         query: str,
         docs: List[str],
         costs: List[int],
-        retriever_scores: Optional[List[float]] = None
+        retriever_scores: Optional[List[float]] = None,
     ) -> List[int]:
-        """
-        Select documents under the token budget using Algorithm 1.
-
-        Args:
-            query: User query string.
-            docs:  List of candidate document strings. Should be ordered by
-                   descending retriever relevance (top-L are used for U).
-            costs: List of token costs c_i for each document.
-            retriever_scores: Optional dense retriever scores rel(d_i, q).
-                              If None, inverse rank is used as a proxy.
-
-        Returns:
-            Sorted list of selected document indices.
-        """
         n = len(docs)
-        assert len(costs) == n, "Length mismatch between docs and costs."
-        if retriever_scores is not None:
-            assert len(retriever_scores) == n, "Length mismatch for retriever_scores."
+        assert len(costs) == n
+
+        if retriever_scores is None:
+            retriever_scores = [1.0 / (i + 1) for i in range(n)]
+        assert len(retriever_scores) == n
+
         concept_weights, doc_concepts = self._build_concept_universe_and_weights(
             docs, retriever_scores
         )
         objective = WeightedCoverageFunction(concept_weights, doc_concepts)
+
         if not concept_weights:
-            sorted_idx=sorted(range(n), key=lambda i: costs[i])
+            print("[Warning] 未提取到概念，退化为 top-k 选择。")
             selected, used = [], 0
-            for idx in sorted_idx:
+            for idx in sorted(range(n),
+                               key=lambda i: retriever_scores[i],
+                               reverse=True):
                 if used + costs[idx] <= self.budget:
                     selected.append(idx)
                     used += costs[idx]
-                else:
-                    break
-            return selected
-        candidates=list(range(n))
-        Sbest = self._best_small_solution(candidates, costs, objective, max_size=2)
+            return sorted(selected)
+
+        candidates = list(range(n))
+        S_best = self._best_small_solution(candidates, costs, objective)
+
         if not self.fast_mode:
-            feasible_seeds = [
-                combo for combo in itertools.combinations(candidates, 3)
-                if sum(costs[i] for i in combo) <= self.budget
-            ]
-            for seed_tuple in feasible_seeds:
-                seed = set(seed_tuple)
+            for seed_tuple in itertools.combinations(candidates, 3):
+                if sum(costs[i] for i in seed_tuple) > self.budget:
+                    continue
                 S_completed = self._density_greedy_completion(
-                    seed, candidates, costs, objective
+                    set(seed_tuple), candidates, costs, objective
                 )
-                if objective.evaluate(S_completed) > objective.evaluate(Sbest):
-                    Sbest = S_completed
+                if objective.evaluate(S_completed) > objective.evaluate(S_best):
+                    S_best = S_completed
         else:
             S_fast = self._density_greedy_completion(
                 set(), candidates, costs, objective
             )
-            if objective.evaluate(S_fast)>objective.evaluate(Sbest):
-                Sbest = S_fast
-        return sorted(list(Sbest))
-    
+            if objective.evaluate(S_fast) > objective.evaluate(S_best):
+                S_best = S_fast
+
+        return sorted(list(S_best))
+
     def get_selected_documents(
         self,
         query: str,
         docs: List[str],
         costs: List[int],
-        retriever_scores: Optional[List[float]] = None
+        retriever_scores: Optional[List[float]] = None,
     ) -> Tuple[List[int], List[str], int]:
-        """Convenience wrapper returning indices, texts, and total cost."""
         indices = self.select(query, docs, costs, retriever_scores)
         selected_docs = [docs[i] for i in indices]
         total_cost = sum(costs[i] for i in indices)
         return indices, selected_docs, total_cost
 
 
-
-# ======================== Example Usage ========================
+# ======================== 快速自测 ========================
 if __name__ == "__main__":
     query = (
         "What are the causes and treatments of type 2 diabetes, "
         "and what lifestyle changes are recommended?"
     )
-
     docs = [
         "Type 2 diabetes is caused by insulin resistance and relative insulin deficiency.",
         "Genetic factors and family history play a significant role in type 2 diabetes risk.",
@@ -473,27 +353,16 @@ if __name__ == "__main__":
         "The pancreas produces insulin which regulates blood sugar levels in the body.",
         "Gestational diabetes occurs during pregnancy and may resolve after delivery.",
     ]
-
     costs = [len(d.split()) for d in docs]
     budget = 40
 
-    # Use fast_mode=True for quick demo; set False for full Algorithm 1 guarantee
     selector = SRAGSelector(budget=budget, concept_depth=10, fast_mode=True)
-    indices, selected, total_cost = selector.get_selected_documents(query, docs, costs)
+    indices, selected, total_cost = selector.get_selected_documents(
+        query, docs, costs
+    )
 
-    print("=" * 70)
-    print("S-RAG: Submodular Document Selection under Knapsack Constraint")
-    print("Algorithm : Partial Enumeration + Density-Greedy (Algorithm 1)")
-    print("=" * 70)
-    print(f"Query        : {query}")
-    print(f"Budget B     : {budget} tokens")
-    print(f"Candidates n : {len(docs)}")
-    print("-" * 70)
-    print(f"Selected k   : {len(indices)} documents (total cost = {total_cost})")
+    print("=" * 60)
+    print(f"预算 B={budget}，候选 n={len(docs)}，选中 k={len(indices)}（总代价={total_cost}）")
     for idx in indices:
-        print(f"  [{idx:2d}] (cost={costs[idx]:2d})  {docs[idx]}")
-    print("-" * 70)
-    print("Theory       : Monotone submodular maximization under knapsack constraint")
-    print("Guarantee    : (1 - 1/e) ≈ 0.632  (Theorem 1, Nemhauser et al. 1978)")
-    print("Objective    : Weighted set-coverage over query-relevant concepts (Eq. 4)")
-    print("=" * 70)
+        print(f"  [{idx}] cost={costs[idx]}  {docs[idx]}")
+    print("=" * 60)
