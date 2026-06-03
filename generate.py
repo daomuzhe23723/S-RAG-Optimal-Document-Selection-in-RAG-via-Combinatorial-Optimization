@@ -217,6 +217,27 @@ def select_mmr(docs, costs, scores, budget, lambda_mmr=0.6):
 
     return selected_indices
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Greedy (Rel/Cost) baseline
+# ─────────────────────────────────────────────────────────────────────────────
+def select_greedy_rel_cost(docs, costs, scores, budget):
+    n = len(docs)
+    candidates = [(i, scores[i] / costs[i]) for i in range(n)]
+    
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    
+    selected_indices = []
+    used = 0
+    for idx, density in candidates:
+        if used + costs[idx] <= budget:
+            selected_indices.append(idx)
+            used += costs[idx]
+        elif used < budget:
+            selected_indices.append(idx)
+            break
+    
+    return selected_indices
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 主函数
@@ -315,6 +336,20 @@ def main(args):
             )
             prompts.append(build_prompt(item["question"], selected, tokenizer))
 
+    elif args.method == "greedy":
+        for i in trange(len(srag_data), desc="Greedy(Rel/Cost) 选择文档"):
+            item = srag_data[i]
+            indices = select_greedy_rel_cost(
+                item["docs"], item["costs"],
+                item["retriever_scores"], args.budget
+            )
+            selected = [item["docs"][j] for j in indices]
+            sel_costs = [item["costs"][j] for j in indices]
+            selected = truncate_passages_to_budget(
+                selected, sel_costs, args.budget, tokenizer
+            )
+            prompts.append(build_prompt(item["question"], selected, tokenizer))
+
     else:
         raise ValueError(f"未知方法：{args.method}")
 
@@ -367,7 +402,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_name",    required=True)
     parser.add_argument("--tokenizer_name",required=True)
     parser.add_argument("--method",        default="topk",
-                        choices=["srag", "topk", "mmr"])
+                        choices=["srag", "topk", "mmr", "greedy"])
     parser.add_argument("--k",             type=int, default=200)
     parser.add_argument("--budget",        type=int, default=4096)
     parser.add_argument("--concept_depth", type=int, default=20)
