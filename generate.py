@@ -306,7 +306,7 @@ def select_mmr(docs, costs, scores, doc_embeddings, budget, lambda_mmr=0.6):
 # ─────────────────────────────────────────────────────────────────────────────
 def select_greedy_rel_cost(docs, costs, scores, budget):
     n = len(docs)
-    candidates = [(i, scores[i] / costs[i]) for i in range(n)]
+    candidates = [(i, scores[i] / max(costs[i], 1)) for i in range(n)]
     
     candidates.sort(key=lambda x: x[1], reverse=True)
     
