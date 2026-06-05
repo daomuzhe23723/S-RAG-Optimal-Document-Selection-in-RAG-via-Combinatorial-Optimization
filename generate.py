@@ -2,23 +2,21 @@
 # -*- coding: utf-8 -*-
 """
 S-RAG 生成与评测主脚本
-修复点：
-  1. load_hotpotqa 改为读 jsonl（与 NQ/ELI5 格式统一）
-  2. Prompt 模板与论文 Appendix B.1 一致
-  3. passage 截断逻辑（论文 §4.1）
-  4. topk / mmr baseline 实现
+缓存策略：
+  - topk / srag：共用 {dataset}_k{k}_retrieved.pkl（已有缓存直接用）
+  - mmr：单独使用 {dataset}_k{k}_mmr_retrieved.pkl（含 BGE embedding，用于余弦相似度）
 """
 
 import json
 import os
 import re
-import math
-from dataclasses import dataclass
-from typing import List, Optional
+import pickle
+from typing import List
 
+import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from tqdm import trange
+from tqdm import tqdm, trange
 
 from retriever import BGERetriever
 from srag_selector import SRAGSelector
@@ -40,10 +38,7 @@ def load_nq(path: str):
                 continue
             raw = json.loads(line)
             answers = [o["answer"] for o in raw.get("output", []) if o.get("answer")]
-            data.append({
-                "question": raw["input"],
-                "answers":  answers,
-            })
+            data.append({"question": raw["input"], "answers": answers})
     return data
 
 
@@ -56,15 +51,11 @@ def load_eli5(path: str):
                 continue
             raw = json.loads(line)
             answers = [o["answer"] for o in raw.get("output", []) if o.get("answer")]
-            data.append({
-                "question": raw.get("input", ""),
-                "answers":  answers,
-            })
+            data.append({"question": raw.get("input", ""), "answers": answers})
     return data
 
 
 def load_hotpotqa(path: str):
-    # ── 修复：改为读 jsonl，与 NQ/ELI5 格式统一 ──
     data = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -72,16 +63,123 @@ def load_hotpotqa(path: str):
             if not line:
                 continue
             raw = json.loads(line)
-            # KILT 格式：output 字段包含 answer
-            if raw.get("output"):
-                answers = [o["answer"] for o in raw["output"] if o.get("answer")]
-            else:
-                answers = []
-            data.append({
-                "question": raw.get("input", ""),
-                "answers":  answers,
-            })
+            answers = [o["answer"] for o in raw["output"] if o.get("answer")] \
+                      if raw.get("output") else []
+            data.append({"question": raw.get("input", ""), "answers": answers})
     return data
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 检索（带断点续传）—— 用于 topk / srag
+# ─────────────────────────────────────────────────────────────────────────────
+def retrieve_with_checkpoint(
+    retriever,
+    questions: List[str],
+    top_k: int,
+    cache_path: str,
+    checkpoint_every: int = 10,
+) -> List:
+    tmp_path = cache_path + ".tmp"
+    retrieve_batch_size = 32
+    start_batch = 0
+    all_results = []
+
+    if os.path.exists(tmp_path):
+        try:
+            with open(tmp_path, "rb") as f:
+                checkpoint = pickle.load(f)
+            all_results = checkpoint["results"]
+            start_batch = checkpoint["next_batch"]
+            print(f"[检索] 从断点恢复，已完成 {len(all_results)} / {len(questions)} 条")
+        except Exception as e:
+            print(f"[检索] 断点读取失败（{e}），从头开始")
+            all_results = []
+            start_batch = 0
+
+    batches = [questions[i : i + retrieve_batch_size]
+               for i in range(0, len(questions), retrieve_batch_size)]
+    total = len(batches)
+    pbar = tqdm(range(start_batch, total), desc="检索中",
+                total=total, initial=start_batch)
+
+    for batch_idx in pbar:
+        batch_q = batches[batch_idx]
+        batch_results = retriever.retrieve(batch_q, top_k=top_k,
+                                           batch_size=len(batch_q))
+        all_results.extend(batch_results)
+        if (batch_idx + 1) % checkpoint_every == 0:
+            with open(tmp_path, "wb") as f:
+                pickle.dump({"results": all_results,
+                             "next_batch": batch_idx + 1}, f)
+            tqdm.write(f"[检索] 已保存 {len(all_results)}/{len(questions)} 条")
+
+    with open(cache_path, "wb") as f:
+        pickle.dump(all_results, f)
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
+    print(f"[检索] 完成，已保存到 {cache_path}")
+    return all_results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 检索（带断点续传）—— 用于 mmr（含 embedding）
+# ─────────────────────────────────────────────────────────────────────────────
+def retrieve_with_embeddings_checkpoint(
+    retriever,
+    questions: List[str],
+    top_k: int,
+    cache_path: str,
+    checkpoint_every: int = 10,
+):
+    tmp_path = cache_path + ".tmp"
+    retrieve_batch_size = 32
+    start_batch = 0
+    all_results = []
+    all_doc_embeddings = []
+
+    if os.path.exists(tmp_path):
+        try:
+            with open(tmp_path, "rb") as f:
+                checkpoint = pickle.load(f)
+            all_results       = checkpoint["results"]
+            all_doc_embeddings = checkpoint["embeddings"]
+            start_batch        = checkpoint["next_batch"]
+            print(f"[MMR检索] 从断点恢复，已完成 {len(all_results)} / {len(questions)} 条")
+        except Exception as e:
+            print(f"[MMR检索] 断点读取失败（{e}），从头开始")
+            all_results = []
+            all_doc_embeddings = []
+            start_batch = 0
+
+    batches = [questions[i : i + retrieve_batch_size]
+               for i in range(0, len(questions), retrieve_batch_size)]
+    total = len(batches)
+    pbar = tqdm(range(start_batch, total), desc="检索中(MMR)",
+                total=total, initial=start_batch)
+
+    for batch_idx in pbar:
+        batch_q = batches[batch_idx]
+        batch_results, batch_embs = retriever.retrieve_with_embeddings(
+            batch_q, top_k=top_k, batch_size=len(batch_q)
+        )
+        all_results.extend(batch_results)
+        all_doc_embeddings.extend(batch_embs)
+
+        if (batch_idx + 1) % checkpoint_every == 0:
+            with open(tmp_path, "wb") as f:
+                pickle.dump({
+                    "results":    all_results,
+                    "embeddings": all_doc_embeddings,
+                    "next_batch": batch_idx + 1,
+                }, f)
+            tqdm.write(f"[MMR检索] 已保存 {len(all_results)}/{len(questions)} 条")
+
+    with open(cache_path, "wb") as f:
+        pickle.dump({"results": all_results, "embeddings": all_doc_embeddings}, f)
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
+    print(f"[MMR检索] 完成，已保存到 {cache_path}")
+    return all_results, all_doc_embeddings
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -106,12 +204,7 @@ def build_srag_inputs(inputs, retrieved_results, tokenizer_name: str):
 # ─────────────────────────────────────────────────────────────────────────────
 # Passage 截断（论文 §4.1）
 # ─────────────────────────────────────────────────────────────────────────────
-def truncate_passages_to_budget(
-    passages: List[str],
-    costs: List[int],
-    budget: int,
-    tokenizer,
-) -> List[str]:
+def truncate_passages_to_budget(passages, costs, budget, tokenizer):
     result = []
     remaining = budget
     for text, cost in zip(passages, costs):
@@ -120,11 +213,8 @@ def truncate_passages_to_budget(
             remaining -= cost
         else:
             if remaining > 0:
-                token_ids = tokenizer.encode(
-                    text, add_special_tokens=False
-                )[:remaining]
-                truncated = tokenizer.decode(token_ids, skip_special_tokens=True)
-                result.append(truncated)
+                token_ids = tokenizer.encode(text, add_special_tokens=False)[:remaining]
+                result.append(tokenizer.decode(token_ids, skip_special_tokens=True))
             break
     return result
 
@@ -146,10 +236,9 @@ def build_prompt(question: str, passages: List[str], tokenizer) -> str:
         content += f"{idx}. {p}\n"
     content += f"\n{INSTRUCTIONS}"
     messages = [{"role": "user", "content": content}]
-    prompt = tokenizer.apply_chat_template(
+    return tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
-    return prompt
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -157,44 +246,41 @@ def build_prompt(question: str, passages: List[str], tokenizer) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 def select_topk(docs, costs, scores, budget):
     order = sorted(range(len(docs)), key=lambda i: scores[i], reverse=True)
-    selected_indices, used = [], 0
+    selected, used = [], 0
     for i in order:
         if used + costs[i] <= budget:
-            selected_indices.append(i)
+            selected.append(i)
             used += costs[i]
         elif used < budget:
-            selected_indices.append(i)
+            selected.append(i)
             break
-    return selected_indices
+    return selected
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MMR baseline
+# MMR baseline（论文标准实现：BGE embedding 余弦相似度）
 # ─────────────────────────────────────────────────────────────────────────────
-def _bow_similarity(text_a: str, text_b: str) -> float:
-    tokens_a = set(re.findall(r"\b[a-z]+\b", text_a.lower()))
-    tokens_b = set(re.findall(r"\b[a-z]+\b", text_b.lower()))
-    if not tokens_a or not tokens_b:
-        return 0.0
-    return len(tokens_a & tokens_b) / len(tokens_a | tokens_b)
-
-
-def select_mmr(docs, costs, scores, budget, lambda_mmr=0.6):
+def select_mmr(docs, costs, scores, doc_embeddings, budget, lambda_mmr=0.6):
+    """
+    论文 MMR：
+        argmax_{d ∉ S} [ λ · rel(d,q) - (1-λ) · max_{d_j ∈ S} cos(emb_d, emb_{d_j}) ]
+    相似度使用 BGE embedding 余弦相似度（已归一化，直接点积即可）。
+    """
     n = len(docs)
-    selected_indices = []
+    selected = []
     used = 0
     remaining_pool = list(range(n))
     max_score = max(scores) if scores else 1.0
     norm_scores = [s / (max_score + 1e-12) for s in scores]
+    embs = np.array(doc_embeddings, dtype=np.float32)  # shape: (n, dim)
 
     while remaining_pool:
         best_idx, best_val = None, -float("inf")
         for i in remaining_pool:
             relevance = norm_scores[i]
-            if selected_indices:
-                redundancy = max(
-                    _bow_similarity(docs[i], docs[j]) for j in selected_indices
-                )
+            if selected:
+                # BGE embedding 已归一化，点积 = 余弦相似度
+                redundancy = float(np.max(embs[selected] @ embs[i]))
             else:
                 redundancy = 0.0
             mmr_val = lambda_mmr * relevance - (1 - lambda_mmr) * redundancy
@@ -203,25 +289,25 @@ def select_mmr(docs, costs, scores, budget, lambda_mmr=0.6):
 
         if best_idx is None:
             break
-
         if used + costs[best_idx] <= budget:
-            selected_indices.append(best_idx)
+            selected.append(best_idx)
             used += costs[best_idx]
         elif used < budget:
-            selected_indices.append(best_idx)
+            selected.append(best_idx)
             break
         else:
             break
-
         remaining_pool.remove(best_idx)
 
-    return selected_indices
+    return selected
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 主函数
 # ─────────────────────────────────────────────────────────────────────────────
 def main(args):
+
+    # ── 加载数据 ──
     if args.dataset == "nq":
         data = load_nq(args.dataset_path)
         max_new_tokens = 128
@@ -234,18 +320,65 @@ def main(args):
     else:
         raise ValueError(f"未知数据集：{args.dataset}")
 
-    retriever = BGERetriever(
-        model_name=args.retriever_name,
-        device="cuda",
-        corpus_dir=args.corpus_dir,
-    )
-    questions = [d["question"] for d in data]
-    retrieved_results = retriever.retrieve(questions, top_k=args.k)
+    os.makedirs("./retriever_cache", exist_ok=True)
 
+    # ── 检索（topk/srag 共用缓存，mmr 单独缓存）──
+    if args.method == "mmr":
+        mmr_cache_path = os.path.join(
+            "./retriever_cache", f"{args.dataset}_k{args.k}_mmr_retrieved.pkl"
+        )
+        if os.path.exists(mmr_cache_path):
+            print(f"[MMR检索] 从缓存加载：{mmr_cache_path}")
+            with open(mmr_cache_path, "rb") as f:
+                mmr_cache = pickle.load(f)
+            retrieved_results  = mmr_cache["results"]
+            all_doc_embeddings = mmr_cache["embeddings"]
+        else:
+            retriever = BGERetriever(
+                model_name=args.retriever_name,
+                device="cuda",
+                corpus_dir=args.corpus_dir,
+            )
+            questions = [d["question"] for d in data]
+            retrieved_results, all_doc_embeddings = retrieve_with_embeddings_checkpoint(
+                retriever=retriever,
+                questions=questions,
+                top_k=args.k,
+                cache_path=mmr_cache_path,
+                checkpoint_every=10,
+            )
+            del retriever
+            torch.cuda.empty_cache()
+    else:
+        retrieval_cache_path = os.path.join(
+            "./retriever_cache", f"{args.dataset}_k{args.k}_retrieved.pkl"
+        )
+        if os.path.exists(retrieval_cache_path):
+            print(f"[检索] 从缓存加载：{retrieval_cache_path}")
+            with open(retrieval_cache_path, "rb") as f:
+                retrieved_results = pickle.load(f)
+        else:
+            retriever = BGERetriever(
+                model_name=args.retriever_name,
+                device="cuda",
+                corpus_dir=args.corpus_dir,
+            )
+            questions = [d["question"] for d in data]
+            retrieved_results = retrieve_with_checkpoint(
+                retriever=retriever,
+                questions=questions,
+                top_k=args.k,
+                cache_path=retrieval_cache_path,
+                checkpoint_every=10,
+            )
+            del retriever
+            torch.cuda.empty_cache()
+        all_doc_embeddings = None
+
+    # ── 构建 srag_data ──
     srag_data = build_srag_inputs(data, retrieved_results, args.tokenizer_name)
-    del retriever
-    torch.cuda.empty_cache()
 
+    # ── 加载生成模型 ──
     tokenizer = AutoTokenizer.from_pretrained(
         args.tokenizer_name, trust_remote_code=True
     )
@@ -263,6 +396,7 @@ def main(args):
 
     MMR_LAMBDA = {"nq": 0.6, "eli5": 0.7, "hotpotqa": 0.5}
 
+    # ── 构建 prompts ──
     prompts = []
 
     if args.method == "srag":
@@ -280,7 +414,7 @@ def main(args):
                 item["costs"], item["retriever_scores"]
             )
             sel_costs = [item["costs"][j] for j in indices]
-            selected = truncate_passages_to_budget(
+            selected  = truncate_passages_to_budget(
                 selected, sel_costs, args.budget, tokenizer
             )
             prompts.append(build_prompt(item["question"], selected, tokenizer))
@@ -288,13 +422,13 @@ def main(args):
     elif args.method == "topk":
         for i in trange(len(srag_data), desc="Top-k 选择文档"):
             item = srag_data[i]
-            indices = select_topk(
+            indices  = select_topk(
                 item["docs"], item["costs"],
                 item["retriever_scores"], args.budget
             )
-            selected = [item["docs"][j] for j in indices]
+            selected  = [item["docs"][j] for j in indices]
             sel_costs = [item["costs"][j] for j in indices]
-            selected = truncate_passages_to_budget(
+            selected  = truncate_passages_to_budget(
                 selected, sel_costs, args.budget, tokenizer
             )
             prompts.append(build_prompt(item["question"], selected, tokenizer))
@@ -302,15 +436,17 @@ def main(args):
     elif args.method == "mmr":
         lam = MMR_LAMBDA.get(args.dataset, 0.6)
         for i in trange(len(srag_data), desc=f"MMR(λ={lam}) 选择文档"):
-            item = srag_data[i]
+            item    = srag_data[i]
             indices = select_mmr(
                 item["docs"], item["costs"],
-                item["retriever_scores"], args.budget,
-                lambda_mmr=lam
+                item["retriever_scores"],
+                all_doc_embeddings[i],        # BGE embedding
+                args.budget,
+                lambda_mmr=lam,
             )
-            selected = [item["docs"][j] for j in indices]
+            selected  = [item["docs"][j] for j in indices]
             sel_costs = [item["costs"][j] for j in indices]
-            selected = truncate_passages_to_budget(
+            selected  = truncate_passages_to_budget(
                 selected, sel_costs, args.budget, tokenizer
             )
             prompts.append(build_prompt(item["question"], selected, tokenizer))
@@ -318,10 +454,11 @@ def main(args):
     else:
         raise ValueError(f"未知方法：{args.method}")
 
+    # ── 批量生成 ──
     outputs = []
     model.eval()
     for i in trange(0, len(prompts), args.batch_size, desc="生成答案"):
-        batch = prompts[i : i + args.batch_size]
+        batch     = prompts[i : i + args.batch_size]
         tokenized = tokenizer(batch, return_tensors="pt", padding=True)
         tokenized = {k: v.to(model.device) for k, v in tokenized.items()}
         with torch.no_grad():
@@ -332,15 +469,17 @@ def main(args):
                 use_cache=True,
             )
         prompt_len = tokenized["input_ids"].shape[1]
-        decoded = [
+        decoded    = [
             tokenizer.decode(o[prompt_len:], skip_special_tokens=True)
             for o in out
         ]
         outputs.extend(decoded)
 
+    # ── 评测 ──
     results = evaluate(outputs, [d["answers"] for d in srag_data], args.dataset)
     print(json.dumps(results, indent=2))
 
+    # ── 保存结果 ──
     result_file = f"{args.dataset}_{args.method}.json"
     with open(result_file, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=4)
@@ -361,19 +500,18 @@ def main(args):
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="S-RAG 生成 & 评测")
-    parser.add_argument("--dataset",       required=True,
+    parser.add_argument("--dataset",        required=True,
                         choices=["nq", "eli5", "hotpotqa"])
-    parser.add_argument("--dataset_path",  required=True)
-    parser.add_argument("--model_name",    required=True)
-    parser.add_argument("--tokenizer_name",required=True)
-    parser.add_argument("--method",        default="topk",
+    parser.add_argument("--dataset_path",   required=True)
+    parser.add_argument("--model_name",     required=True)
+    parser.add_argument("--tokenizer_name", required=True)
+    parser.add_argument("--method",         default="topk",
                         choices=["srag", "topk", "mmr"])
-    parser.add_argument("--k",             type=int, default=200)
-    parser.add_argument("--budget",        type=int, default=4096)
-    parser.add_argument("--concept_depth", type=int, default=20)
-    parser.add_argument("--batch_size",    type=int, default=1)
-    parser.add_argument("--retriever_name",type=str, default="./bge-large-en-v1.5")
-    parser.add_argument("--corpus_dir",    type=str, default="./wiki_dpr_text_only",
-                        help="wiki_dpr parquet 文件所在目录")
+    parser.add_argument("--k",              type=int, default=200)
+    parser.add_argument("--budget",         type=int, default=4096)
+    parser.add_argument("--concept_depth",  type=int, default=20)
+    parser.add_argument("--batch_size",     type=int, default=1)
+    parser.add_argument("--retriever_name", type=str, default="./bge-large-en-v1.5")
+    parser.add_argument("--corpus_dir",     type=str, default="./wiki_dpr_text_only")
     args = parser.parse_args()
     main(args)

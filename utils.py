@@ -48,12 +48,17 @@ def lcs(text1: List[str], text2: List[str]) -> int:
         prev_row = current_row
     return prev_row[n]
 
-def compute_rouge_l(prediction: str, reference: str) -> int:
+def compute_rouge_l(prediction: str, reference: str) -> float:
     prediction = normalize_text(prediction)
-    reference = normalize_text(reference)
-    lcs_len = lcs(prediction.split(), reference.split())
-    precision = lcs_len / len(prediction.split())
-    recall = lcs_len / len(reference.split())
+    reference  = normalize_text(reference)
+    pred_tokens = prediction.split()
+    ref_tokens  = reference.split()
+    # 空字符串保护，避免除以 0 产生 NaN
+    if not pred_tokens or not ref_tokens:
+        return 0.0
+    lcs_len   = lcs(pred_tokens, ref_tokens)
+    precision = lcs_len / len(pred_tokens)
+    recall    = lcs_len / len(ref_tokens)
     if precision + recall == 0:
         return 0.0
     return 2 * precision * recall / (precision + recall)
@@ -62,7 +67,10 @@ def rouge_l_best_ref(prediction: str, references: List[str]) -> float:
     """与多个参考分别计算，取最高 F1。"""
     if not references:
         return 0.0
-    return max(compute_rouge_l(prediction, ref) for ref in references)
+    # 过滤掉空参考答案，避免 NaN
+    scores = [compute_rouge_l(prediction, ref) for ref in references if ref.strip()]
+    return max(scores) if scores else 0.0
+
 def evaluate_rouge_l(predictions: List[str], references: List[str]) -> float:
     assert len(predictions) == len(references)
     rouge_l = [rouge_l_best_ref(p, r) for p, r in zip(predictions, references)]
@@ -71,7 +79,7 @@ def evaluate_rouge_l(predictions: List[str], references: List[str]) -> float:
 def evaluate_bert_score(predictions: List[str], references: List[str]) -> float:
     assert len(predictions) == len(references)
     flat_preds, flat_refs = [], []
-    pred_idx_map = []  # 记录每个 flat 项对应第几个问题
+    pred_idx_map = []
     for idx, (pred, refs) in enumerate(zip(predictions, references)):
         if not refs:
             continue
@@ -86,7 +94,6 @@ def evaluate_bert_score(predictions: List[str], references: List[str]) -> float:
     batch_size = 16
     lang = "en"
     model_type = "roberta-large"
-    model_dir = "./roberta-large"
     P, R, F1 = bert_score_fn(
             flat_preds,
             flat_refs,
@@ -95,7 +102,7 @@ def evaluate_bert_score(predictions: List[str], references: List[str]) -> float:
             batch_size=batch_size,
             lang=lang,
             verbose=False,
-            rescale_with_baseline=False  
+            rescale_with_baseline=False
         )
     best_f1_per_sample = [0.0] * len(predictions)
     f1_values = F1.cpu().numpy()
@@ -111,10 +118,10 @@ def evaluate(
 ):
     results = {}
     if dataset == "eli5":
-        results["rouge_l"] = evaluate_rouge_l(predictions, references)
+        results["rouge_l"]    = evaluate_rouge_l(predictions, references)
         results["bert_score"] = evaluate_bert_score(predictions, references)
     else:
-        results["em"] = evaluate_em(predictions, references)
-        results["rouge_l"] = evaluate_rouge_l(predictions, references)
+        results["em"]         = evaluate_em(predictions, references)
+        results["rouge_l"]    = evaluate_rouge_l(predictions, references)
         results["bert_score"] = evaluate_bert_score(predictions, references)
-    return results  
+    return results

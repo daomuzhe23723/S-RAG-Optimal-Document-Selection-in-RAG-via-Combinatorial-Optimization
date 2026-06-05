@@ -4,6 +4,7 @@
 BGE 检索器
 - 从 parquet 文件读取 wiki_dpr 语料库
 - 支持断点续建 FAISS 索引
+- 支持返回文档 embedding（用于 MMR 余弦相似度）
 """
 
 import os
@@ -42,17 +43,16 @@ class BGERetriever:
 
         print(f"[Retriever] 加载模型 {model_name} ...")
         self.model = SentenceTransformer(model_name, device=device)
-        self.emb_dim = self.model.get_embedding_dimension()
+        self.emb_dim = self.model.get_sentence_embedding_dimension()
 
         self.corpus = None
         self.index  = None
         self._load_or_build_corpus()
 
     def _load_or_build_corpus(self):
-        corpus_path   = os.path.join(self.cache_dir, "corpus.pkl")
-        index_path    = os.path.join(self.cache_dir, "faiss_bge.index")
+        corpus_path = os.path.join(self.cache_dir, "corpus.pkl")
+        index_path  = os.path.join(self.cache_dir, "faiss_bge.index")
 
-        # ── 完整缓存已存在，直接加载 ──
         if os.path.exists(corpus_path) and os.path.exists(index_path):
             print("[Retriever] 从缓存加载语料库与索引 ...")
             with open(corpus_path, "rb") as f:
@@ -61,7 +61,6 @@ class BGERetriever:
             print(f"[Retriever] 语料库大小：{len(self.corpus):,}，索引维度：{self.emb_dim}")
             return
 
-        # ── 从 parquet 读取语料库 ──
         print("[Retriever] 从 parquet 文件加载语料库 ...")
         parquet_files = sorted(glob.glob(os.path.join(self.corpus_dir, "*.parquet")))
         if not parquet_files:
@@ -82,18 +81,14 @@ class BGERetriever:
                 })
 
         print(f"[Retriever] 语料库加载完毕，共 {len(self.corpus):,} 条。")
-
-        # ── 构建索引（支持断点续建）──
         self._build_faiss_index(batch_size=8192, checkpoint_every=20)
 
-        # ── 保存最终缓存 ──
         print("[Retriever] 保存语料库缓存 ...")
         with open(corpus_path, "wb") as f:
             pickle.dump(self.corpus, f)
         faiss.write_index(self.index, index_path)
         print("[Retriever] 索引构建完毕并已缓存。")
 
-        # ── 清理临时文件 ──
         for p in [
             os.path.join(self.cache_dir, "build_progress.json"),
             os.path.join(self.cache_dir, "faiss_bge.index.tmp"),
@@ -102,17 +97,12 @@ class BGERetriever:
                 os.remove(p)
 
     def _build_faiss_index(self, batch_size: int = 8192, checkpoint_every: int = 20):
-        """
-        构建 FAISS 内积索引，支持断点续建。
-        每 checkpoint_every 个 batch 保存一次临时索引到磁盘。
-        """
         progress_path  = os.path.join(self.cache_dir, "build_progress.json")
         index_tmp_path = os.path.join(self.cache_dir, "faiss_bge.index.tmp")
 
         texts = [f"{item['title']} {item['text']}" for item in self.corpus]
         start_idx = 0
 
-        # ── 尝试从断点恢复 ──
         if os.path.exists(progress_path) and os.path.exists(index_tmp_path):
             try:
                 with open(progress_path, "r") as f:
@@ -153,24 +143,24 @@ class BGERetriever:
             self.index.add(embeddings.astype("float32"))
             batches_since_ckpt += 1
 
-            # ── 定期保存 checkpoint ──
             if batches_since_ckpt >= checkpoint_every:
                 faiss.write_index(self.index, index_tmp_path)
                 with open(progress_path, "w") as f:
                     json.dump({"last_processed_idx": i + len(batch)}, f)
-                os.sync()
+                try:
+                    os.sync()
+                except AttributeError:
+                    pass
                 batches_since_ckpt = 0
                 pbar.set_postfix({"已保存": f"{i + len(batch):,}/{len(texts):,}"})
 
-    def retrieve(
-        self,
-        queries: list,
-        top_k: int = 200,
-        batch_size: int = 32,
-    ):
-        """查询端加 QUERY_INSTRUCTION 前缀（BGE 官方推荐）。"""
+    def retrieve(self, queries: list, top_k: int = 200, batch_size: int = 32):
+        """
+        标准检索，返回结果列表。
+        用于 topk / srag 方法。
+        """
         all_results = []
-        for i in tqdm(range(0, len(queries), batch_size), desc="检索中"):
+        for i in tqdm(range(0, len(queries), batch_size), desc="检索中", disable=True):
             batch = [
                 self.QUERY_INSTRUCTION + q
                 for q in queries[i : i + batch_size]
@@ -181,14 +171,10 @@ class BGERetriever:
                 normalize_embeddings=True,
                 show_progress_bar=False,
             )
-            scores, indices = self.index.search(
-                embeddings.astype("float32"), top_k
-            )
+            scores, indices = self.index.search(embeddings.astype("float32"), top_k)
             for q_scores, q_indices in zip(scores, indices):
                 results = []
-                for rank, (s, idx) in enumerate(
-                    zip(q_scores, q_indices), start=1
-                ):
+                for rank, (s, idx) in enumerate(zip(q_scores, q_indices), start=1):
                     item = self.corpus[idx]
                     results.append({
                         "id":    item["id"],
@@ -199,3 +185,44 @@ class BGERetriever:
                     })
                 all_results.append(results)
         return all_results
+
+    def retrieve_with_embeddings(
+        self, queries: list, top_k: int = 200, batch_size: int = 32
+    ):
+        """
+        检索并同时返回每篇文档的 BGE embedding。
+        用于 MMR 方法（余弦相似度计算）。
+        返回：(all_results, all_doc_embeddings)
+            all_doc_embeddings[i][j]: 第 i 个 query 的第 j 篇文档的 1024 维 embedding
+        """
+        all_results = []
+        all_doc_embeddings = []
+        for i in tqdm(range(0, len(queries), batch_size), desc="检索中(MMR)", disable=True):
+            batch = [
+                self.QUERY_INSTRUCTION + q
+                for q in queries[i : i + batch_size]
+            ]
+            embeddings = self.model.encode(
+                batch,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
+            scores, indices = self.index.search(embeddings.astype("float32"), top_k)
+            for q_scores, q_indices in zip(scores, indices):
+                results = []
+                doc_embs = []
+                for rank, (s, idx) in enumerate(zip(q_scores, q_indices), start=1):
+                    item = self.corpus[idx]
+                    results.append({
+                        "id":    item["id"],
+                        "title": item["title"],
+                        "text":  item["text"],
+                        "score": float(s),
+                        "rank":  rank,
+                    })
+                    # 从 FAISS 索引直接取出已存好的 embedding，无需重新编码
+                    doc_embs.append(self.index.reconstruct(int(idx)))
+                all_results.append(results)
+                all_doc_embeddings.append(doc_embs)
+        return all_results, all_doc_embeddings
