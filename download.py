@@ -7,9 +7,6 @@
 
 import os
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 2：下载 BGE 检索模型（如果还没下）
-# ─────────────────────────────────────────────────────────────────────────────
 if not os.path.exists("./bge-large-en-v1.5"):
     from sentence_transformers import SentenceTransformer
     print("下载 BAAI/bge-large-en-v1.5 ...")
@@ -19,9 +16,6 @@ if not os.path.exists("./bge-large-en-v1.5"):
 else:
     print("bge-large-en-v1.5 已存在，跳过。")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 3：下载 RoBERTa-large（用于 BERTScore 评测）
-# ─────────────────────────────────────────────────────────────────────────────
 if not os.path.exists("./roberta-large"):
     from transformers import AutoModel, AutoTokenizer
     print("下载 roberta-large ...")
@@ -33,9 +27,6 @@ if not os.path.exists("./roberta-large"):
 else:
     print("roberta-large 已存在，跳过。")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 7：下载 NLTK 资源（srag_selector.py 需要）
-# ─────────────────────────────────────────────────────────────────────────────
 import nltk
 for pkg, path in [
     ('punkt_tab',                        'tokenizers/punkt_tab'),

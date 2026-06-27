@@ -14,9 +14,6 @@ from collections import Counter
 from typing import Dict, List, Optional, Set, Tuple
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ConceptExtractor
-# ─────────────────────────────────────────────────────────────────────────────
 class ConceptExtractor:
     """
     从文本中提取概念。
@@ -134,15 +131,7 @@ class ConceptExtractor:
         return {k: v / total for k, v in counts.items()}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# WeightedCoverageFunction
-# ─────────────────────────────────────────────────────────────────────────────
 class WeightedCoverageFunction:
-    """
-    论文公式 (4)：
-        f(S) = Σ_{u∈U} w(u) · 1[ u ∈ ∪_{d∈S} U(d) ]
-    """
-
     def __init__(self,
                  concept_weights: Dict[str, float],
                  doc_concepts: List[Set[str]]):
@@ -162,15 +151,7 @@ class WeightedCoverageFunction:
         return float(sum(self.concept_weights.get(u, 0.0) for u in new))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SRAGSelector
-# ─────────────────────────────────────────────────────────────────────────────
 class SRAGSelector:
-    """
-    论文 Algorithm 1：Partial Enumeration + Density-Greedy Completion
-    近似比保证：(1 - 1/e) ≈ 0.632  (Theorem 1)
-    """
-
     def __init__(self,
                  budget: int,
                  concept_extractor: Optional[ConceptExtractor] = None,
@@ -335,34 +316,3 @@ class SRAGSelector:
         return indices, selected_docs, total_cost
 
 
-# ======================== 快速自测 ========================
-if __name__ == "__main__":
-    query = (
-        "What are the causes and treatments of type 2 diabetes, "
-        "and what lifestyle changes are recommended?"
-    )
-    docs = [
-        "Type 2 diabetes is caused by insulin resistance and relative insulin deficiency.",
-        "Genetic factors and family history play a significant role in type 2 diabetes risk.",
-        "Obesity and sedentary lifestyle are major modifiable risk factors for diabetes.",
-        "Treatment includes metformin as first-line therapy and lifestyle modifications.",
-        "Insulin therapy may be required when oral medications fail to control blood glucose.",
-        "Regular exercise and dietary changes can significantly improve glycemic control.",
-        "Diabetic retinopathy is a common complication affecting the eyes.",
-        "Cardiovascular disease risk is elevated in patients with poorly controlled diabetes.",
-        "The pancreas produces insulin which regulates blood sugar levels in the body.",
-        "Gestational diabetes occurs during pregnancy and may resolve after delivery.",
-    ]
-    costs = [len(d.split()) for d in docs]
-    budget = 40
-
-    selector = SRAGSelector(budget=budget, concept_depth=10, fast_mode=True)
-    indices, selected, total_cost = selector.get_selected_documents(
-        query, docs, costs
-    )
-
-    print("=" * 60)
-    print(f"预算 B={budget}，候选 n={len(docs)}，选中 k={len(indices)}（总代价={total_cost}）")
-    for idx in indices:
-        print(f"  [{idx}] cost={costs[idx]}  {docs[idx]}")
-    print("=" * 60)

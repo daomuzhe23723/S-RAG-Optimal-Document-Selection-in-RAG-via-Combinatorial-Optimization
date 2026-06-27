@@ -2,9 +2,6 @@ import os
 import json
 from datasets import load_dataset
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 1：下载 NQ (Natural Questions)
-# ─────────────────────────────────────────────────────────────────────────────
 if not os.path.exists("./nq_test.jsonl"):
     print("下载 NQ 测试集 ...")
     nq = load_dataset("facebook/kilt_tasks", "nq", split="validation")
@@ -15,9 +12,6 @@ if not os.path.exists("./nq_test.jsonl"):
 else:
     print("nq_test.jsonl 已存在，跳过。")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 2：下载 ELI5
-# ─────────────────────────────────────────────────────────────────────────────
 if not os.path.exists("./eli5_test.jsonl"):
     print("下载 ELI5 测试集 ...")
     eli5 = load_dataset("facebook/kilt_tasks", "eli5", split="validation")
@@ -28,9 +22,6 @@ if not os.path.exists("./eli5_test.jsonl"):
 else:
     print("eli5_test.jsonl 已存在，跳过。")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 3：下载 HotpotQA
-# ─────────────────────────────────────────────────────────────────────────────
 if not os.path.exists("./hotpotqa_test.jsonl"):
     print("下载 HotpotQA 测试集 ...")
     hotpot = load_dataset("facebook/kilt_tasks", "hotpotqa", split="validation")

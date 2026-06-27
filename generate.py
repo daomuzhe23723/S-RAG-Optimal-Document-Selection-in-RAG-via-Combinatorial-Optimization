@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-S-RAG 生成与评测主脚本
-缓存策略：
-  - topk / srag：共用 {dataset}_k{k}_retrieved.pkl（已有缓存直接用）
-  - mmr：单独使用 {dataset}_k{k}_mmr_retrieved.pkl（含 BGE embedding，用于余弦相似度）
-"""
-
 import json
 import os
 import re
@@ -26,9 +19,6 @@ import argparse
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 数据加载
-# ─────────────────────────────────────────────────────────────────────────────
 def load_nq(path: str):
     data = []
     with open(path, "r", encoding="utf-8") as f:
@@ -69,9 +59,6 @@ def load_hotpotqa(path: str):
     return data
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 检索（带断点续传）—— 用于 topk / srag
-# ─────────────────────────────────────────────────────────────────────────────
 def retrieve_with_checkpoint(
     retriever,
     questions: List[str],
@@ -121,9 +108,6 @@ def retrieve_with_checkpoint(
     return all_results
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 检索（带断点续传）—— 用于 mmr（含 embedding）
-# ─────────────────────────────────────────────────────────────────────────────
 def retrieve_with_embeddings_checkpoint(
     retriever,
     questions: List[str],
@@ -182,9 +166,6 @@ def retrieve_with_embeddings_checkpoint(
     return all_results, all_doc_embeddings
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 构建 srag_data
-# ─────────────────────────────────────────────────────────────────────────────
 def build_srag_inputs(inputs, retrieved_results, tokenizer_name: str):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
     srag_inputs = []
@@ -201,9 +182,6 @@ def build_srag_inputs(inputs, retrieved_results, tokenizer_name: str):
     return srag_inputs
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Passage 截断（论文 §4.1）
-# ─────────────────────────────────────────────────────────────────────────────
 def truncate_passages_to_budget(passages, costs, budget, tokenizer):
     result = []
     remaining = budget
@@ -219,9 +197,6 @@ def truncate_passages_to_budget(passages, costs, budget, tokenizer):
     return result
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Prompt 模板（论文 Appendix B.1）
-# ─────────────────────────────────────────────────────────────────────────────
 INSTRUCTIONS = (
     "Instructions: Answer the question using the passages. "
     "Be concise and factual. If multiple passages support the answer, "
@@ -241,9 +216,6 @@ def build_prompt(question: str, passages: List[str], tokenizer) -> str:
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Top-k baseline
-# ─────────────────────────────────────────────────────────────────────────────
 def select_topk(docs, costs, scores, budget):
     order = sorted(range(len(docs)), key=lambda i: scores[i], reverse=True)
     selected, used = [], 0
@@ -257,29 +229,20 @@ def select_topk(docs, costs, scores, budget):
     return selected
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MMR baseline（论文标准实现：BGE embedding 余弦相似度）
-# ─────────────────────────────────────────────────────────────────────────────
 def select_mmr(docs, costs, scores, doc_embeddings, budget, lambda_mmr=0.6):
-    """
-    论文 MMR：
-        argmax_{d ∉ S} [ λ · rel(d,q) - (1-λ) · max_{d_j ∈ S} cos(emb_d, emb_{d_j}) ]
-    相似度使用 BGE embedding 余弦相似度（已归一化，直接点积即可）。
-    """
     n = len(docs)
     selected = []
     used = 0
     remaining_pool = list(range(n))
     max_score = max(scores) if scores else 1.0
     norm_scores = [s / (max_score + 1e-12) for s in scores]
-    embs = np.array(doc_embeddings, dtype=np.float32)  # shape: (n, dim)
+    embs = np.array(doc_embeddings, dtype=np.float32) 
 
     while remaining_pool:
         best_idx, best_val = None, -float("inf")
         for i in remaining_pool:
             relevance = norm_scores[i]
             if selected:
-                # BGE embedding 已归一化，点积 = 余弦相似度
                 redundancy = float(np.max(embs[selected] @ embs[i]))
             else:
                 redundancy = 0.0
@@ -301,9 +264,6 @@ def select_mmr(docs, costs, scores, doc_embeddings, budget, lambda_mmr=0.6):
     
     return selected
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Greedy (Rel/Cost) baseline
-# ─────────────────────────────────────────────────────────────────────────────
 def select_greedy_rel_cost(docs, costs, scores, budget):
     n = len(docs)
     candidates = [(i, scores[i] / max(costs[i], 1)) for i in range(n)]
@@ -321,12 +281,8 @@ def select_greedy_rel_cost(docs, costs, scores, budget):
             break
     
     return selected_indices
-# ─────────────────────────────────────────────────────────────────────────────
-# 主函数
-# ─────────────────────────────────────────────────────────────────────────────
-def main(args):
 
-    # ── 加载数据 ──
+def main(args):
     if args.dataset == "nq":
         data = load_nq(args.dataset_path)
         max_new_tokens = 128
@@ -341,7 +297,6 @@ def main(args):
 
     os.makedirs("./retriever_cache", exist_ok=True)
 
-    # ── 检索（topk/srag 共用缓存，mmr 单独缓存）──
     if args.method == "mmr":
         mmr_cache_path = os.path.join(
             "./retriever_cache", f"{args.dataset}_k{args.k}_mmr_retrieved.pkl"
@@ -394,10 +349,8 @@ def main(args):
             torch.cuda.empty_cache()
         all_doc_embeddings = None
 
-    # ── 构建 srag_data ──
     srag_data = build_srag_inputs(data, retrieved_results, args.tokenizer_name)
 
-    # ── 加载生成模型 ──
     tokenizer = AutoTokenizer.from_pretrained(
         args.tokenizer_name, trust_remote_code=True
     )
@@ -415,7 +368,6 @@ def main(args):
 
     MMR_LAMBDA = {"nq": 0.6, "eli5": 0.7, "hotpotqa": 0.5}
 
-    # ── 构建 prompts ──
     prompts = []
 
     if args.method == "srag":
@@ -459,7 +411,7 @@ def main(args):
             indices = select_mmr(
                 item["docs"], item["costs"],
                 item["retriever_scores"],
-                all_doc_embeddings[i],        # BGE embedding
+                all_doc_embeddings[i],       
                 args.budget,
                 lambda_mmr=lam,
             )
@@ -487,7 +439,6 @@ def main(args):
         raise ValueError(f"未知方法：{args.method}")
     
 
-    # ── 批量生成 ──
     outputs = []
     model.eval()
     for i in trange(0, len(prompts), args.batch_size, desc="生成答案"):
@@ -508,11 +459,9 @@ def main(args):
         ]
         outputs.extend(decoded)
 
-    # ── 评测 ──
     results = evaluate(outputs, [d["answers"] for d in srag_data], args.dataset)
     print(json.dumps(results, indent=2))
 
-    # ── 保存结果 ──
     result_file = f"{args.dataset}_{args.method}.json"
     with open(result_file, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=4)
@@ -530,7 +479,6 @@ def main(args):
     print(f"预测已保存至 {pred_file}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="S-RAG 生成 & 评测")
     parser.add_argument("--dataset",        required=True,

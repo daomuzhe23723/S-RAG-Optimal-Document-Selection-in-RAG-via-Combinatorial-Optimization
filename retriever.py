@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-BGE 检索器
-- 从 parquet 文件读取 wiki_dpr 语料库
-- 支持断点续建 FAISS 索引
-- 支持返回文档 embedding（用于 MMR 余弦相似度）
-"""
-
 import os
 import glob
 import json
@@ -20,13 +13,6 @@ from tqdm import tqdm
 
 
 class BGERetriever:
-    """
-    论文配置（§4.1）：
-        Encoder : BAAI/bge-large-en-v1.5（1024 维）
-        Corpus  : DPR Wikipedia passages（psgs_w100）
-        top_k   : 200
-    """
-
     QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
 
     def __init__(
@@ -155,10 +141,6 @@ class BGERetriever:
                 pbar.set_postfix({"已保存": f"{i + len(batch):,}/{len(texts):,}"})
 
     def retrieve(self, queries: list, top_k: int = 200, batch_size: int = 32):
-        """
-        标准检索，返回结果列表。
-        用于 topk / srag 方法。
-        """
         all_results = []
         for i in tqdm(range(0, len(queries), batch_size), desc="检索中", disable=True):
             batch = [
@@ -189,12 +171,6 @@ class BGERetriever:
     def retrieve_with_embeddings(
         self, queries: list, top_k: int = 200, batch_size: int = 32
     ):
-        """
-        检索并同时返回每篇文档的 BGE embedding。
-        用于 MMR 方法（余弦相似度计算）。
-        返回：(all_results, all_doc_embeddings)
-            all_doc_embeddings[i][j]: 第 i 个 query 的第 j 篇文档的 1024 维 embedding
-        """
         all_results = []
         all_doc_embeddings = []
         for i in tqdm(range(0, len(queries), batch_size), desc="检索中(MMR)", disable=True):
@@ -221,7 +197,6 @@ class BGERetriever:
                         "score": float(s),
                         "rank":  rank,
                     })
-                    # 从 FAISS 索引直接取出已存好的 embedding，无需重新编码
                     doc_embs.append(self.index.reconstruct(int(idx)))
                 all_results.append(results)
                 all_doc_embeddings.append(doc_embs)
